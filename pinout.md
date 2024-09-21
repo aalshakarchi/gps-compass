@@ -1,0 +1,10 @@
+E-ink display
+
+CLK 13
+MISO 12
+MOSI 11
+ECS 10
+D/C 6
+RST 7
+BUSY 8
+ENA 9
