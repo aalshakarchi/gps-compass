@@ -2,37 +2,27 @@
 
 ## E-ink display
 
-CLK 13
-MISO 12
-MOSI 11
-ECS 10
-D/C 6
-RST 7
-BUSY 8
-ENA 9
+CLK 36
+MISO 37
+MOSI 35
+ECS 34
+D/C 7
+RST 6
+BUSY 1
+ENA 2
 
 ## GPS
 
-TX 4
-RX 5
+TX 44
+RX 43
 
 ## IMU
 
-SCL 19
-SDA 18
+SCL 9
+SDA 8
 
 ## Stepper motor
 
-AIN1 0
-AIN2 1
-BIN1 2
-BIN2 3
-ENA  D15
-
-## Hall effect sensor
-
-Measure D14
-
-## Battery 
-
-Measure voltage
+PWM 3
+Position 4
+ENA  5
