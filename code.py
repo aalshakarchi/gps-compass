@@ -3,12 +3,12 @@ import math
 import alarm
 import board
 import digitalio
+import analogio
 import esp32
 import busio
 import displayio
 import terminalio
 from adafruit_ssd1681 import SSD1681
-import adafruit_gps
 import adafruit_icm20x
 import tinys3
 import wifi
@@ -19,6 +19,10 @@ import adafruit_ntp
 import json
 import rtc
 from adafruit_display_text import label
+from adafruit_display_shapes.rect import Rect
+import fourwire
+import pwmio
+import pulseio
 
 # Import the date data from dates.py
 from dates import date_coordinates
@@ -32,6 +36,8 @@ displayio.release_displays()
 spi = board.SPI()  # Uses SCK and MOSI
 epd_cs = board.D34
 epd_dc = board.D7
+epd_ena = digitalio.DigitalInOut(board.D6)
+epd_ena.direction = digitalio.Direction.OUTPUT
 epd_reset = board.D43
 epd_busy = board.D44
 display_bus = fourwire.FourWire(
@@ -41,23 +47,34 @@ display_bus = fourwire.FourWire(
 # Initialize the e-ink display with 200x200 pixels resolution
 display = SSD1681(display_bus, width=200, height=200, busy_pin=epd_busy) # rotation=180
 
-# Setup for GPS (UART)
-uart = busio.UART(board.TX, board.RX, baudrate=9600, timeout=10)
-gps = adafruit_gps.GPS(uart, debug=False)
-
-# Turn on the basic GGA and RMC info
-gps.send_command(b'PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0')
-gps.send_command(b'PMTK220,1000')  # 1 Hz update rate
-
 # Setup for IMU (I2C)
-# i2c = busio.I2C(board.SCL, board.SDA)
-# icm = adafruit_icm20x.ICM20948(i2c)
+i2c = busio.I2C(board.SCL, board.SDA)
+icm = adafruit_icm20x.ICM20948(i2c)
+
+# Servo pins
+servo_ena = digitalio.DigitalInOut(board.D1)
+servo_pin = board.D2
+# feedback_pin = board.D3
+feedback_pin = digitalio.DigitalInOut(board.D3)
+servo_ena.direction = digitalio.Direction.OUTPUT
+pwm = pwmio.PWMOut(servo_pin, frequency=50)
+# feedback = pulseio.PulseIn(feedback_pin, maxlen=2, idle_state=True)#, maxlen=2)#, idle_state=False)
+feedback_pin.direction = digitalio.Direction.INPUT
 
 # Magnetic declination for your location (in degrees)
 declination_angle = 2.12  # You can adjust this value based on your location
 
 # Earth radius in kilometers
 EARTH_RADIUS_KM = 6371.0
+
+# Servo feedback values
+CYCLE_DURATION_NS = 1089000  # 1089 ms or 1.089 seconds
+DUTY_CYCLE_MIN = 0.09
+DUTY_CYCLE_MAX = 0.84
+ALPHA = 0.1
+filtered_high_pulse = 0
+filtered_low_pulse = 0
+filtered_position = 0
 
 # Function to parse YAML-like config file
 def load_config(file_path):
@@ -200,19 +217,34 @@ def day_of_year(month, day):
     days_in_months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
     return days_in_months[month - 1] + day
 
-# Function to find the closest date based on the current GPS date
+# Function to find the closest date (before or after) based on the current GPS date
 def find_closest_date(gps_month, gps_day):
-    current_day_of_year = day_of_year(gps_month, gps_day)
+    # Helper function to calculate day of the year
+    def day_of_year(month, day):
+        days_in_months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        return days_in_months[month - 1] + day
+
+    # Helper function to calculate the difference in days between two dates (ignoring year)
+    def day_difference(month1, day1, month2, day2):
+        # Convert both dates to day of the year
+        day_of_year_1 = day_of_year(month1, day1)
+        day_of_year_2 = day_of_year(month2, day2)
+
+        # Calculate the difference in days and handle wrapping around the year
+        forward_diff = (day_of_year_2 - day_of_year_1) % 365
+        backward_diff = (day_of_year_1 - day_of_year_2) % 365
+
+        # Return the smaller of the forward or backward difference
+        return min(forward_diff, backward_diff)
+
+    # Initialize variables to store the closest date
     closest_diff = 999999  # Large number for comparison
     closest_date = None
 
+    # Loop through all available dates
     for date in date_coordinates:
-        date_day_of_year = day_of_year(date["month"], date["day"])
-        
-        # Calculate the difference, accounting for year wrapping
-        diff = date_day_of_year - current_day_of_year
-        if diff < 0:
-            diff += 365  # If the date is in the next year, wrap around
+        # Calculate the difference in days between the current date and the event date
+        diff = day_difference(gps_month, gps_day, date["month"], date["day"])
 
         # If this date is closer than the previously found closest date
         if diff < closest_diff:
@@ -220,7 +252,6 @@ def find_closest_date(gps_month, gps_day):
             closest_date = date
 
     return closest_date
-
 # Function to calculate heading from GPS coordinates to target coordinates
 def calculate_heading(lat1, lon1, lat2, lon2):
     lat1 = math.radians(lat1)
@@ -265,25 +296,114 @@ def get_compass_orientation(declination):
 
     return heading
 
+# Function to apply low-pass filtering (exponential moving average)
+def low_pass_filter(previous_value, new_value, alpha):
+    return previous_value * (1 - alpha) + new_value * alpha
+
+# Function to read the servo position using PWM feedback
+def read_servo_position():
+
+    while not pin.value:
+        pass
+    
+    # Capture the start time for the high pulse
+    start_time = time.monotonic_ns()
+    
+    # Wait for the pin to go low (end of high pulse)
+    while pin.value:
+        pass
+    
+    # Calculate elapsed time for the high pulse in nanoseconds
+    high_time_ns = (time.monotonic_ns() - start_time)
+    return high_pulse_duration
+
+    # Wait for the pin to go low (start of low pulse)
+    while pin.value:
+        pass
+    
+    # Capture the start time for the low pulse
+    start_time = time.monotonic_ns()
+    
+    # Wait for the pin to go high (end of low pulse)
+    while not pin.value:
+        pass
+    
+    # Calculate elapsed time for the low pulse in nanoseconds
+    elapsed_time_ns = (time.monotonic_ns() - start_time)
+    return low_pulse_duration
+
+    if high_pulse_duration > low_pulse_duration:
+        duty_cycle = (high_pulse_duration / CYCLE_DURATION_NS)
+    else:
+        duty_cycle = (1 - low_pulse_duration / CYCLE_DURATION_NS)
+    position = 360 * (duty_cycle - DUTY_CYCLE_MIN) / (DUTY_CYCLE_MAX - DUTY_CYCLE_MIN)
+    if position < 0:
+        position = 0
+    elif position > 360:
+        position = 360
+    return position
+
+# Function to control servo movement with Proportional Control
+def set_servo_position(target_position):
+    Kp = 0.5  # Proportional gain (adjust as needed)
+    
+    while True:
+        raw_position = read_servo_position()
+        current_position = low_pass_filter(current_position, raw_position, ALPHA)
+        error = target_position - current_position
+        
+        if abs(error) < 0.01:  # If the error is small enough, stop
+            print(f"Position reached: {current_position}")
+            break
+        
+        # Adjust speed proportional to the error
+        speed = Kp * error
+        speed = max(min(speed, 1.0), -1.0)  # Limit speed between -1.0 and 1.0
+        
+        # Map speed to PWM duty cycle (1000 to 2000 µs pulse width)
+        pulse_width = 1500 + (speed * 500)
+        duty_cycle = int(pulse_width / 20000 * 65535)
+        
+        # Set the PWM duty cycle to adjust the motor
+        pwm.duty_cycle = duty_cycle
+        
+        print(f"Current position: {current_position}, Target: {target_position}, Speed: {speed}")
+        time.sleep(0.1)  # Small delay to allow the servo to move
+
 # Function to update display with date and distance
-def update_display(day, month, year, distance):
+def update_display(day, month, year, distance, bmp):
     display_group = displayio.Group()  # Create a group to hold display content
+
+    # Add a white rectangle background
+    background = Rect(0, 0, display.width, display.height, fill=0xFFFFFF)  # White background
+    display_group.append(background)  # Add background to display group first
+
+    print("/bmp/"+bmp)
+
+    # Load the emoji bitmap and position on display
+    emoji_bitmap = displayio.OnDiskBitmap("/bmp/"+bmp)  # Place your emoji.bmp file on the device
+    emoji_tilegrid = displayio.TileGrid(emoji_bitmap, pixel_shader=emoji_bitmap.pixel_shader)
+    emoji_tilegrid.x = 8
+    emoji_tilegrid.y = 20
+    display_group.append(emoji_tilegrid)
 
     # Text for the date
     date_text = f"{day}/{month}/{year}"
+    print(f"Date string: {date_text}")
     
     # Text for the distance
-    distance_text = f"{distance:.2f} km"
+    distance_text = "{:,}km".format(int(distance))
+    print(f"Distance string: {distance_text}")
 
     # Add both date and distance to the display group
-    text_area = label.Label(terminalio.FONT, text=date_text, color=0x000000)
-    text_area.x = 20
-    text_area.y = 50
+    text_area = label.Label(terminalio.FONT, text=date_text, color=0x000000, scale=3)
+    text_area.x = 8
+    text_area.y = 115
     display_group.append(text_area)
 
-    text_area2 = label.Label(terminalio.FONT, text=distance_text, color=0x000000)
-    text_area2.x = 20
-    text_area2.y = 80
+    text_area2 = label.Label(terminalio.FONT, text=distance_text, color=0x000000, scale=3)
+    text_area2.x = 8
+    text_area2.y = 160
     display_group.append(text_area2)
 
     print("About to sleep for refresh...")
@@ -313,42 +433,58 @@ def main():
 
     epd_ena.value = True # Switch on display
 
-    # Example usage
-    coordinates = get_location_time(config_file_path)
+    # servo_ena.value = True
+    # while True:
+    #     print(feedback_pin.value)
 
-    if coordinates:
-        latitude, longitude, accuracy, current_time = coordinates
-        print(f"Coordinates: {latitude}, {longitude}, with {accuracy} meters accuracy.")
-        print(f"Current time: {current_time}")
-    else:
-        print("Could not determine location.")
-        update_display(1, 1, 1111, -1)
-
-    time.sleep(2)
-    print("I'm going to try updating the display")
-    time.sleep(2)
-    update_display(1, 1, 2024, 3141)
-    print("I've updated display")
+    coordinates = None # Initiailize coordinates as None to enter the loop
+    current_time = None # Initiailize current_time as None to enter the loop
+    while not coordinates or not current_time:
+        coordinates = get_location_time(config_file_path)
+        if coordinates:
+            latitude, longitude, accuracy, current_time = coordinates
+            print(f"Coordinates: {latitude}, {longitude}, with {accuracy} meters accuracy.")
+            print(f"Current time: {current_time}")
+        else:
+            print("Could not determine location or time, will try again in 10 seconds")
+            time.sleep(10)
 
     # Find the closest date
     closest_date = find_closest_date(current_time.tm_mon, current_time.tm_mday)
 
     # Calculate the distance and heading
-    distance = calculate_distance(latitude, longitude, closest_date["latitude"], closest_date["longitude"])
-    heading = calculate_heading(latitude, longitude, closest_date["latitude"], closest_date["longitude"])
+    target_distance = calculate_distance(latitude, longitude, closest_date["latitude"], closest_date["longitude"])
+    target_heading = calculate_heading(latitude, longitude, closest_date["latitude"], closest_date["longitude"])
 
-    print(f"Target Heading: {heading:.2f} degrees")
-    print(f"Target Distance: {distance:.2f} km")
+    print(f"Target Heading: {target_heading:.2f} degrees")
+    print(f"Target Distance: {target_distance:.2f} km")
 
     # Update the e-ink display with the closest date and distance
-    update_display(closest_date["day"], closest_date["month"], closest_date["year"], distance)
+    update_display(closest_date["day"], closest_date["month"], closest_date["year"], target_distance, closest_date["bmp"])
+
+    # Get the current compass heading from the IMU
+    current_heading = get_compass_orientation(declination_angle)
+    print(f"Current IMU Heading: {current_heading:.2f} degrees")
+
+    # Calculate the difference between current heading and target heading
+    heading_diff = target_heading - current_heading
+    print(f"Heading difference: {heading_diff:.2f} degrees")
 
     # Check battery voltage
-    voltage = get_battery_voltage()
+    voltage = tinys3.get_battery_voltage()
     print(f"Battery Voltage: {voltage:.2f} V")
 
-    
     epd_ena.value = False # Switch off display
+
+    servo_ena.value = True # Switch on servo
+
+    while True:
+        raw_position = read_servo_position()
+        current_position = low_pass_filter(current_position, raw_position, ALPHA)
+        print(current_position)
+        time.sleep(0.1)
+
+    servo_ena.value = False # Switch off servo
 
     # Enter deep sleep for 10 seconds
     enter_deep_sleep(3600)
