@@ -4,12 +4,12 @@ import alarm
 import board
 import digitalio
 import analogio
-import esp32
 import busio
 import displayio
 import terminalio
 from adafruit_ssd1681 import SSD1681
 import adafruit_icm20x
+import esp32
 import tinys3
 import wifi
 import ssl
@@ -67,14 +67,13 @@ declination_angle = 2.12  # You can adjust this value based on your location
 # Earth radius in kilometers
 EARTH_RADIUS_KM = 6371.0
 
-# Servo feedback values
+# Servo settings
 CYCLE_DURATION_NS = 1089000  # 1089 ms or 1.089 seconds
-DUTY_CYCLE_MIN = 0.09
-DUTY_CYCLE_MAX = 0.84
-ALPHA = 0.1
-filtered_high_pulse = 0
-filtered_low_pulse = 0
-filtered_position = 0
+DUTY_CYCLE_MIN = 0.07
+DUTY_CYCLE_MAX = 0.9
+ALPHA = 0.2
+servo_pulse_width = 1465
+needle_offset = 0
 
 # Function to parse YAML-like config file
 def load_config(file_path):
@@ -211,7 +210,6 @@ def get_location_time(config_file_path):
 
     return None
 
-
 # Function to calculate the day of the year
 def day_of_year(month, day):
     days_in_months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
@@ -252,6 +250,7 @@ def find_closest_date(gps_month, gps_day):
             closest_date = date
 
     return closest_date
+
 # Function to calculate heading from GPS coordinates to target coordinates
 def calculate_heading(lat1, lon1, lat2, lon2):
     lat1 = math.radians(lat1)
@@ -300,75 +299,110 @@ def get_compass_orientation(declination):
 def low_pass_filter(previous_value, new_value, alpha):
     return previous_value * (1 - alpha) + new_value * alpha
 
-# Function to read the servo position using PWM feedback
-def read_servo_position():
-
-    while not pin.value:
-        pass
-    
-    # Capture the start time for the high pulse
-    start_time = time.monotonic_ns()
-    
-    # Wait for the pin to go low (end of high pulse)
-    while pin.value:
-        pass
-    
-    # Calculate elapsed time for the high pulse in nanoseconds
-    high_time_ns = (time.monotonic_ns() - start_time)
-    return high_pulse_duration
-
-    # Wait for the pin to go low (start of low pulse)
-    while pin.value:
-        pass
-    
-    # Capture the start time for the low pulse
-    start_time = time.monotonic_ns()
-    
-    # Wait for the pin to go high (end of low pulse)
-    while not pin.value:
-        pass
-    
-    # Calculate elapsed time for the low pulse in nanoseconds
-    elapsed_time_ns = (time.monotonic_ns() - start_time)
-    return low_pulse_duration
-
-    if high_pulse_duration > low_pulse_duration:
-        duty_cycle = (high_pulse_duration / CYCLE_DURATION_NS)
+# Function to start and stop motor
+def motor(state):
+    if state:
+        duty_cycle = int(servo_pulse_width / 20000 * 65535)
     else:
-        duty_cycle = (1 - low_pulse_duration / CYCLE_DURATION_NS)
-    position = 360 * (duty_cycle - DUTY_CYCLE_MIN) / (DUTY_CYCLE_MAX - DUTY_CYCLE_MIN)
-    if position < 0:
-        position = 0
-    elif position > 360:
-        position = 360
-    return position
+        duty_cycle = int(1500 / 20000 * 65535) # Stop
+    pwm.duty_cycle = duty_cycle
+
+
+# Function to read the servo position using PWM feedback
+def read_servo_position(raw=False):
+
+    filtered_position = 0
+    counter = 0
+
+    while counter < 100:
+
+        while not feedback_pin.value:
+            pass
+        
+        # Capture the start time for the high pulse
+        start_time = time.monotonic_ns()
+        
+        # Wait for the pin to go low (end of high pulse)
+        while feedback_pin.value:
+            pass
+        
+        # Calculate elapsed time for the high pulse in nanoseconds
+        high_pulse_duration = (time.monotonic_ns() - start_time)
+
+        # Wait for the pin to go low (start of low pulse)
+        while feedback_pin.value:
+            pass
+        
+        # Capture the start time for the low pulse
+        start_time = time.monotonic_ns()
+        
+        # Wait for the pin to go high (end of low pulse)
+        while not feedback_pin.value:
+            pass
+        
+        # Calculate elapsed time for the low pulse in nanoseconds
+        low_pulse_duration = (time.monotonic_ns() - start_time)
+
+        if high_pulse_duration > low_pulse_duration:
+            duty_cycle = (high_pulse_duration / CYCLE_DURATION_NS)
+        else:
+            duty_cycle = (1 - low_pulse_duration / CYCLE_DURATION_NS)
+        
+        position = 360 * (duty_cycle - DUTY_CYCLE_MIN) / (DUTY_CYCLE_MAX - DUTY_CYCLE_MIN)
+        
+        # Limit position to 0-360 degrees
+        if position < 0:
+            position = 0
+        elif position > 360:
+            position = 360
+
+        if raw:
+            return position
+
+        filtered_position = low_pass_filter(filtered_position, position, ALPHA)
+        counter += 1
+
+    return filtered_position
 
 # Function to control servo movement with Proportional Control
 def set_servo_position(target_position):
-    Kp = 0.5  # Proportional gain (adjust as needed)
+    Kp = 0.01  # Proportional gain (adjust as needed)
     
-    while True:
-        raw_position = read_servo_position()
-        current_position = low_pass_filter(current_position, raw_position, ALPHA)
-        error = target_position - current_position
-        
-        if abs(error) < 0.01:  # If the error is small enough, stop
-            print(f"Position reached: {current_position}")
-            break
-        
-        # Adjust speed proportional to the error
-        speed = Kp * error
-        speed = max(min(speed, 1.0), -1.0)  # Limit speed between -1.0 and 1.0
-        
-        # Map speed to PWM duty cycle (1000 to 2000 µs pulse width)
-        pulse_width = 1500 + (speed * 500)
-        duty_cycle = int(pulse_width / 20000 * 65535)
-        
-        # Set the PWM duty cycle to adjust the motor
-        pwm.duty_cycle = duty_cycle
-        
-        print(f"Current position: {current_position}, Target: {target_position}, Speed: {speed}")
-        time.sleep(0.1)  # Small delay to allow the servo to move
+    counter = 0
+    filtered_position = 0
+
+    # Run servo position for 100 counts until the position stabilizes, before moving servo
+    while counter < 100:
+        filtered_position = low_pass_filter(filtered_position, read_servo_position(raw=True), ALPHA)
+        counter += 1
+
+    # Check if needle is more than 10 degrees further than it needs to be
+    if abs(target_position - filtered_position) > 10:
+
+        # Start motor
+        motor(True)
+
+        counter = 0
+
+        while True:
+
+            filtered_position = low_pass_filter(filtered_position, read_servo_position(raw=True), ALPHA)
+            counter += 1
+            
+            if abs(target_position - filtered_position) < 10:  # If the error is small enough, stop
+                print(f"Position reached: {filtered_position}")
+                motor(False)
+                return
+
+            # Stop motor and restart every 100 counts, to enable measurement to catch up
+            if counter >50:
+                motor(False)
+            if counter > 200:
+                motor(True)
+                counter = 0
+            
+            print(f"Target position: {target_position}, current: {filtered_position:.0f}, error: {target_position - filtered_position}, counter: {counter}")
+
 
 # Function to update display with date and distance
 def update_display(day, month, year, distance, bmp):
@@ -478,11 +512,14 @@ def main():
 
     servo_ena.value = True # Switch on servo
 
+    target = 10
     while True:
-        raw_position = read_servo_position()
-        current_position = low_pass_filter(current_position, raw_position, ALPHA)
-        print(current_position)
-        time.sleep(0.1)
+        print(f"Target position: {target}")
+        set_servo_position(target)
+        target += 35
+        if target > 360:
+            target = 0
+        time.sleep(1)
 
     servo_ena.value = False # Switch off servo
 
