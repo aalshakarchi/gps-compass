@@ -45,7 +45,7 @@ display_bus = fourwire.FourWire(
 )
 
 # Initialize the e-ink display with 200x200 pixels resolution
-display = SSD1681(display_bus, width=200, height=200, busy_pin=epd_busy) # rotation=180
+display = SSD1681(display_bus, width=200, height=200, busy_pin=epd_busy, rotation=180)
 
 # Setup for IMU (I2C)
 i2c = busio.I2C(board.SCL, board.SDA)
@@ -67,11 +67,14 @@ declination_angle = 2.12  # You can adjust this value based on your location
 # Earth radius in kilometers
 EARTH_RADIUS_KM = 6371.0
 
+# Low battery
+LOW_BATTERY = 3.0
+
 # Servo settings
 CYCLE_DURATION_NS = 1089000  # 1089 ms or 1.089 seconds
-DUTY_CYCLE_MIN = 0.07
-DUTY_CYCLE_MAX = 0.9
-ALPHA = 0.2
+DUTY_CYCLE_MIN = 0.08
+DUTY_CYCLE_MAX = 0.89
+ALPHA = 0.5
 servo_pulse_width = 1465
 needle_offset = 0
 
@@ -284,14 +287,43 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 
 # Function to get compass orientation from magnetometer readings
 def get_compass_orientation(declination):
-    mag = icm.magnetic  # Get magnetometer data
-    heading = math.atan2(mag[1], mag[0])  # atan2(mag_y, mag_x)
-    heading = math.degrees(heading) + declination  # Adjust for magnetic declination
     
-    if heading < 0:
-        heading += 360
-    elif heading >= 360:
-        heading -= 360
+    while not i2c.try_lock():
+        pass  # Wait until the lock is acquired
+    try:
+        i2c.writeto(0x69, bytes([0x06, 0x01]))  # Wake IMU up
+    finally:
+        i2c.unlock()
+    time.sleep(0.1)
+    
+    print("'I've woken up")
+    time.sleep(5)
+
+    filtered_heading = 0
+    counter = 0
+    while counter < 100:
+
+        mag = icm.magnetic  # Get magnetometer data
+        heading = math.atan2(-mag[0], -mag[1])  # atan2(mag_y, mag_x), note Y and X are swapped based on how I've installed these plus -
+        heading = math.degrees(heading) + declination  # Adjust for magnetic declination
+        
+        if heading < 0:
+            heading += 360
+        elif heading >= 360:
+            heading -= 360
+
+        filtered_heading = low_pass_filter(filtered_heading, heading, ALPHA)
+        # print(f"Filtered heading: {filtered_heading:.0f}, raw heading: {heading}, magY: {mag[1]}, magX: {mag[0]}, counter: {counter}")
+        counter += 1
+        time.sleep(0.01)
+
+    while not i2c.try_lock():
+        pass  # Wait until the lock is acquired
+    try:
+        i2c.writeto(0x69, bytes([0x06, 0x40])) # Put IMU to sleep
+    finally:
+        i2c.unlock()
+    time.sleep(0.1)
 
     return heading
 
@@ -306,7 +338,6 @@ def motor(state):
     else:
         duty_cycle = int(1500 / 20000 * 65535) # Stop
     pwm.duty_cycle = duty_cycle
-
 
 # Function to read the servo position using PWM feedback
 def read_servo_position(raw=False):
@@ -389,7 +420,7 @@ def set_servo_position(target_position):
             filtered_position = low_pass_filter(filtered_position, read_servo_position(raw=True), ALPHA)
             counter += 1
             
-            if abs(target_position - filtered_position) < 10:  # If the error is small enough, stop
+            if abs(target_position - filtered_position) < 5:  # If the error is small enough, stop
                 print(f"Position reached: {filtered_position}")
                 motor(False)
                 return
@@ -401,11 +432,10 @@ def set_servo_position(target_position):
                 motor(True)
                 counter = 0
             
-            print(f"Target position: {target_position}, current: {filtered_position:.0f}, error: {target_position - filtered_position}, counter: {counter}")
-
+            # print(f"Target position: {target_position}, current: {filtered_position:.0f}, error: {target_position - filtered_position}, counter: {counter}")
 
 # Function to update display with date and distance
-def update_display(day, month, year, distance, bmp):
+def update_display(day, month, year, number, unit, bmp):
     display_group = displayio.Group()  # Create a group to hold display content
 
     # Add a white rectangle background
@@ -425,9 +455,10 @@ def update_display(day, month, year, distance, bmp):
     date_text = f"{day}/{month}/{year}"
     print(f"Date string: {date_text}")
     
-    # Text for the distance
-    distance_text = "{:,}km".format(int(distance))
-    print(f"Distance string: {distance_text}")
+    # Text for the distance / voltage
+    decimal_places = 0 if unit=="km" else 2
+    number_text = "{:.{}f}{}".format(number,decimal_places,unit)
+    print(f"Number string: {number_text}")
 
     # Add both date and distance to the display group
     text_area = label.Label(terminalio.FONT, text=date_text, color=0x000000, scale=3)
@@ -435,7 +466,7 @@ def update_display(day, month, year, distance, bmp):
     text_area.y = 115
     display_group.append(text_area)
 
-    text_area2 = label.Label(terminalio.FONT, text=distance_text, color=0x000000, scale=3)
+    text_area2 = label.Label(terminalio.FONT, text=number_text, color=0x000000, scale=3)
     text_area2.x = 8
     text_area2.y = 160
     display_group.append(text_area2)
@@ -450,12 +481,37 @@ def update_display(day, month, year, distance, bmp):
     display.root_group = display_group  # Set the root group for the display
     display.refresh()  # Refresh the display to show the new content
 
+# Function to calculate the number of seconds until the next target wake-up time (7 PM)
+def calculate_seconds_until_wake_up():
+    now = time.localtime()  # Get the current local time
+    
+    target_hour = 19  # 7 PM in 24-hour format
+    target_minute = 0
+    target_second = 0
+
+    # If it's before 7 PM today
+    if now.tm_hour < target_hour:
+        hours_until_target = target_hour - now.tm_hour
+    # If it's 7 PM or later, calculate how many hours until 7 PM tomorrow
+    else:
+        hours_until_target = (24 - now.tm_hour) + target_hour
+
+    # Calculate the remaining minutes and seconds
+    minutes_until_target = 60 - now.tm_min - 1
+    seconds_until_target = 60 - now.tm_sec
+
+    # Total time in seconds until next target time
+    total_seconds = (hours_until_target * 3600) + (minutes_until_target * 60) + seconds_until_target
+    print(f"Seconds until wake-up time: {total_seconds}")
+
+    return total_seconds
+
 # Function to enter deep sleep setup
 def enter_deep_sleep(duration_seconds):
-    
     print(f"Entering deep sleep for {duration_seconds} seconds...")
 
     # Set a timer alarm to wake up after the specified number of seconds
+    print(time.monotonic())
     time_alarm = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + duration_seconds)
 
     # Enter deep sleep until the alarm goes off
@@ -465,11 +521,18 @@ def main():
     
     print("Good morning!")
 
+    servo_ena.value = False # Switch off servo
     epd_ena.value = True # Switch on display
 
-    # servo_ena.value = True
-    # while True:
-    #     print(feedback_pin.value)
+    # Check if low battery
+    if tinys3.get_battery_voltage() < LOW_BATTERY:
+        update_display(current_time.tm_mday, current_time.tm_mon, current_time.tm_year, tinys3.get_battery_voltage(), "V", "charging.bmp")
+        epd_ena.value = False
+        enter_deep_sleep(3600)
+        return
+
+    print(f"5V is: {tinys3.get_vbus_present()}, vbat is: {tinys3.get_battery_voltage()}")
+    time.sleep(5)
 
     coordinates = None # Initiailize coordinates as None to enter the loop
     current_time = None # Initiailize current_time as None to enter the loop
@@ -483,6 +546,11 @@ def main():
             print("Could not determine location or time, will try again in 10 seconds")
             time.sleep(10)
 
+    if tinys3.get_vbus_present():
+        update_display(current_time.tm_mday, current_time.tm_mon, current_time.tm_year, tinys3.get_battery_voltage(), "V", "charging.bmp")
+        enter_deep_sleep(600)
+        return
+
     # Find the closest date
     closest_date = find_closest_date(current_time.tm_mon, current_time.tm_mday)
 
@@ -494,7 +562,7 @@ def main():
     print(f"Target Distance: {target_distance:.2f} km")
 
     # Update the e-ink display with the closest date and distance
-    update_display(closest_date["day"], closest_date["month"], closest_date["year"], target_distance, closest_date["bmp"])
+    update_display(closest_date["day"], closest_date["month"], closest_date["year"], target_distance, "km", closest_date["bmp"])
 
     # Get the current compass heading from the IMU
     current_heading = get_compass_orientation(declination_angle)
@@ -502,29 +570,19 @@ def main():
 
     # Calculate the difference between current heading and target heading
     heading_diff = target_heading - current_heading
+    if heading_diff < 0: # Adjust for negative heading diff
+        heading_diff += 360
     print(f"Heading difference: {heading_diff:.2f} degrees")
-
-    # Check battery voltage
-    voltage = tinys3.get_battery_voltage()
-    print(f"Battery Voltage: {voltage:.2f} V")
 
     epd_ena.value = False # Switch off display
 
     servo_ena.value = True # Switch on servo
-
-    target = 10
-    while True:
-        print(f"Target position: {target}")
-        set_servo_position(target)
-        target += 35
-        if target > 360:
-            target = 0
-        time.sleep(1)
-
+    set_servo_position(heading_diff + needle_offset) # Set servo to right heading
+    # set_servo_position(0) # Uncomment for mounting the needle
     servo_ena.value = False # Switch off servo
 
-    # Enter deep sleep for 10 seconds
-    enter_deep_sleep(3600)
+    # Enter deep sleep until 7pm tomorrow
+    enter_deep_sleep(calculate_seconds_until_wake_up())
 
 while True:
     main()

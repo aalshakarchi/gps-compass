@@ -37,7 +37,7 @@ def get_battery_voltage():
     ADC_RESOLUTION = 2 ** 16 -1
     AREF_VOLTAGE = 3.3
     R1 = 442000
-    R2 = 160000
+    R2 = 156000
     return (vbat_voltage.value/ADC_RESOLUTION*AREF_VOLTAGE*(R1+R2)/R2)
 
 
